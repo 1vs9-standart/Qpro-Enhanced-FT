@@ -3,7 +3,7 @@
 ## [Watch the demo!](https://youtu.be/BR_hIHFeo80)
 [![Watch the demo](https://github.com/user-attachments/assets/df6e8aab-7081-449b-bb0d-14f7e286a5b3)](https://youtu.be/BR_hIHFeo80)
 
-## ROOT IS REQUIRED FOR THIS TO FUNCITON. IF YOU ARE NOT ON v2.6 OR LOWER THIS WILL NOT WORK
+## ROOT IS REQUIRED FOR THIS TO FUNCITON. IF YOU ARE NOT ON v2.7 OR LOWER THIS WILL NOT WORK
 [Root details](https://github.com/Lumince/singularity)
 
 ## Download
@@ -40,6 +40,7 @@ rooted Quest Pro and currently supports USB only.
   slower, especially for the full dataset.
 
 ## First run
+DISCLAIMER: Eye convergence may NOT work on modern firmwares, I have ONLY tested it on version `51483620027600340`
 
 1. Extract the entire release folder. Do not run the executable from inside the zip.
 2. Double-click `QproFaceTracking.exe`.
