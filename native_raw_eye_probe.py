@@ -25,6 +25,7 @@ from native_eye_pupil_probe import KernelToPcMonotonicClock
 
 
 ENGINE_PATH = "/odm/lib64/libtrackingengines.so"
+# August 5 2026 engine. Kept intact; it is not the size check for every firmware.
 EXPECTED_ENGINE_SIZE = 47_724_232
 TRACE_ROOT = "/sys/kernel/tracing"
 TRACE_INSTANCE = "qpro_raw_eye"
@@ -34,10 +35,71 @@ TRACE_GROUP = "qpro_raw_eye"
 # VisionInterfaceResultsPublisher::publish calls the left EyeData accessor, then
 # the right accessor. At these two instruction boundaries x21 and x0 hold the
 # respective EyeData pointers. raw_gaze.visual_axis is EyeData + 0x300.
+# The live reader on that engine uses only DETECTOR_PROBE_OFFSET.
 LEFT_PROBE_OFFSET = 0xA0AAF0
 RIGHT_PROBE_OFFSET = 0xA0AAF8
 PREMERGE_PROBE_OFFSET = 0xB87EE0
 DETECTOR_PROBE_OFFSET = 0xB63FE4
+
+
+@dataclass(frozen=True)
+class TrackingEngineProfile:
+    name: str
+    size: int
+    sha256: str | None
+    probe_offset: int
+    fetch: str
+    event_name: str
+
+
+# Tagged detector stack probe verified on the 47,724,232-byte engine.
+AUGUST_20260805_PROFILE = TrackingEngineProfile(
+    name="seacliff-20260805",
+    size=EXPECTED_ENGINE_SIZE,
+    sha256=None,
+    probe_offset=DETECTOR_PROBE_OFFSET,
+    fetch=(
+        "x=+0x30(%sp):x32 y=+0x34(%sp):x32 z=+0x38(%sp):x32 "
+        "tag=+0x0(%x19):x32"
+    ),
+    event_name="detector_output",
+)
+
+# Verified on headset firmware 51503870024400340 (ODM built Wed Aug 26 19:34:45
+# PDT 2026). /odm is the read-only odm-verity image; this is not a Magisk overlay.
+# Offset 0xB20F58 is the first instruction after VisualAxisDetector method
+# 0xB20710 stores both eye vectors (str d0/str s1 to x20+0x30 and x20+0xC0).
+# A read-only uprobe on FaceCam produced independent unit-length eye rays.
+# The August offsets are not used for this hash.
+SEACLIFF_51503870024400340_PROFILE = TrackingEngineProfile(
+    name="seacliff-51503870024400340",
+    size=47_418_280,
+    sha256="0fb6f54a3e190bec791d757ea18d32a8ecc1af4a861992d04b1703c93293cd03",
+    probe_offset=0xB20F58,
+    fetch=(
+        "lx=+0x30(%x20):x32 ly=+0x34(%x20):x32 lz=+0x38(%x20):x32 "
+        "rx=+0xc0(%x20):x32 ry=+0xc4(%x20):x32 rz=+0xc8(%x20):x32"
+    ),
+    event_name="detector_pair",
+)
+
+
+def select_tracking_engine(size: int, sha256: str | None) -> TrackingEngineProfile:
+    if size == AUGUST_20260805_PROFILE.size:
+        return AUGUST_20260805_PROFILE
+    if size == SEACLIFF_51503870024400340_PROFILE.size:
+        if sha256 != SEACLIFF_51503870024400340_PROFILE.sha256:
+            raise RuntimeError(
+                "Tracking-engine size matches firmware 51503870024400340 but "
+                f"sha256 is {sha256}; refusing firmware-specific probe offsets"
+            )
+        return SEACLIFF_51503870024400340_PROFILE
+    raise RuntimeError(
+        f"Tracking-engine size changed ({size}, expected "
+        f"{AUGUST_20260805_PROFILE.size} or "
+        f"{SEACLIFF_51503870024400340_PROFILE.size}); "
+        "do not use firmware-specific probe offsets"
+    )
 
 TRACE_SAMPLE = re.compile(
     r"(?P<time>\d+\.\d+): qpro_(?P<eye>left|right): .*?"
@@ -55,6 +117,12 @@ DETECTOR_SAMPLE = re.compile(
     r"(?P<time>\d+\.\d+): detector_output: .*?"
     r"x=0x(?P<x>[0-9a-fA-F]+) y=0x(?P<y>[0-9a-fA-F]+) "
     r"z=0x(?P<z>[0-9a-fA-F]+) tag=0x(?P<tag>[0-9a-fA-F]+)"
+)
+DETECTOR_PAIR_SAMPLE = re.compile(
+    r"(?P<time>\d+\.\d+): detector_pair: .*?"
+    r"lx=0x(?P<lx>[0-9a-fA-F]+) ly=0x(?P<ly>[0-9a-fA-F]+) "
+    r"lz=0x(?P<lz>[0-9a-fA-F]+) rx=0x(?P<rx>[0-9a-fA-F]+) "
+    r"ry=0x(?P<ry>[0-9a-fA-F]+) rz=0x(?P<rz>[0-9a-fA-F]+)"
 )
 
 
@@ -221,6 +289,46 @@ class DetectorOutputParser:
             left_vector=left_vector,
             right_vector=right_vector,
         )
+
+
+def _unit_gaze(vector: tuple[float, float, float]) -> bool:
+    if not all(math.isfinite(component) and abs(component) < 5 for component in vector):
+        return False
+    length = math.sqrt(sum(component * component for component in vector))
+    return 0.75 <= length <= 1.25
+
+
+class StereoDetectorParser:
+    """Both eyes from one VisualAxisDetector hit on firmware 51503870024400340.
+
+    Non-unit values are dropped so a mismatched register cannot drive gaze.
+    """
+
+    def __init__(self) -> None:
+        self._last_signature: tuple[object, ...] | None = None
+
+    def parse(self, line: str, pc_monotonic_ns: int) -> RawEyeSample | None:
+        match = DETECTOR_PAIR_SAMPLE.search(line)
+        if not match:
+            return None
+        left = tuple(float_from_trace_hex(match.group(axis)) for axis in ("lx", "ly", "lz"))
+        right = tuple(float_from_trace_hex(match.group(axis)) for axis in ("rx", "ry", "rz"))
+        if not _unit_gaze(left) or not _unit_gaze(right):
+            return None
+        signature = (left, right)
+        if signature == self._last_signature:
+            return None
+        self._last_signature = signature
+        return RawEyeSample(
+            pc_monotonic_ns=pc_monotonic_ns,
+            kernel_time_s=float(match.group("time")),
+            left_valid=True,
+            right_valid=True,
+            left_vector=left,  # type: ignore[arg-type]
+            right_vector=right,  # type: ignore[arg-type]
+        )
+
+
 class PersistentAdbRootShell:
     """One live Magisk shell for tracefs control commands.
 
@@ -337,6 +445,7 @@ class RawTraceEyeReader:
         self._configured = False
         self._clock = KernelToPcMonotonicClock()
         self._root_shell: PersistentAdbRootShell | None = None
+        self.profile: TrackingEngineProfile | None = None
 
     @property
     def instance_path(self) -> str:
@@ -369,11 +478,15 @@ class RawTraceEyeReader:
         )
 
     def _cleanup(self) -> None:
-        if self._root_shell is None:
-            return
         instance = self.instance_path
         self._adb_root(f"echo 0 '>' {instance}/tracing_on", check=False)
-        for name in ("detector_output", "qpro_inputs", "qpro_left", "qpro_right"):
+        for name in (
+            "detector_output",
+            "detector_pair",
+            "qpro_inputs",
+            "qpro_left",
+            "qpro_right",
+        ):
             self._adb_root(
                 f"echo 0 '>' {instance}/events/{TRACE_GROUP}/{name}/enable",
                 check=False,
@@ -411,11 +524,46 @@ class RawTraceEyeReader:
                 break
             time.sleep(0.15)
         if not removed:
-            raise RuntimeError(
-                "Could not release the previous headset eye-trace workspace. "
-                "Stop any other independent-gaze preview and try again."
+            print(
+                "WARNING: eye-trace workspace still busy after Stop; "
+                "the next gaze start will retry cleanup.",
+                flush=True,
             )
         self._configured = False
+
+    def _popen_adb_cat(self, *remote_args: str) -> subprocess.Popen[str]:
+        return subprocess.Popen(
+            [self.adb, "shell", *remote_args],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+
+    def _open_trace_pipe(self) -> subprocess.Popen[str]:
+        """Prefer a non-root cat so tongue's live-adb-su is the only Magisk session.
+
+        Two concurrent `su` sessions plus VRChat on the same USB cable freeze
+        detector samples at 0 Hz after a few seconds.
+        """
+        pipe_path = f"{self.instance_path}/trace_pipe"
+        self._adb_root(f"chmod 0755 {self.instance_path}", check=False)
+        self._adb_root(f"chmod 0444 {pipe_path}", check=False)
+        unprivileged = self._popen_adb_cat(f"cat {pipe_path}")
+        time.sleep(0.2)
+        if unprivileged.poll() is None:
+            print("Eye trace reader: cat without extra Magisk su", flush=True)
+            return unprivileged
+        unprivileged.kill()
+        try:
+            unprivileged.wait(timeout=1.0)
+        except subprocess.TimeoutExpired:
+            pass
+        print("Eye trace reader: falling back to Magisk su cat", flush=True)
+        return self._popen_adb_cat(f"su -c 'cat {pipe_path}'")
 
     def start(self) -> None:
         state = subprocess.run(
@@ -431,38 +579,44 @@ class RawTraceEyeReader:
             engine_size = int(size_result.stdout.strip().splitlines()[-1])
         except (ValueError, IndexError) as error:
             raise RuntimeError("Could not verify the headset tracking-engine build") from error
-        if engine_size != EXPECTED_ENGINE_SIZE:
-            raise RuntimeError(
-                f"Tracking-engine size changed ({engine_size}, expected "
-                f"{EXPECTED_ENGINE_SIZE}); do not use firmware-specific probe offsets"
-            )
+        engine_sha256 = None
+        if engine_size == SEACLIFF_51503870024400340_PROFILE.size:
+            digest = self._adb_root(f"sha256sum {ENGINE_PATH}", timeout=20)
+            try:
+                engine_sha256 = digest.stdout.strip().split()[0]
+            except IndexError as error:
+                raise RuntimeError("Could not hash the headset tracking engine") from error
+        self.profile = select_tracking_engine(engine_size, engine_sha256)
+        print(
+            "Tracking-engine profile "
+            f"{self.profile.name}: size {self.profile.size}, "
+            f"probe 0x{self.profile.probe_offset:x}",
+            flush=True,
+        )
 
         self._cleanup()
         self._adb_root(f"mkdir {self.instance_path}")
         try:
             self._write_event(
-                f"p:{TRACE_GROUP}/detector_output {ENGINE_PATH}:0x{DETECTOR_PROBE_OFFSET:x} "
-                "x=+0x30(%sp):x32 y=+0x34(%sp):x32 z=+0x38(%sp):x32 "
-                "tag=+0x0(%x19):x32"
+                f"p:{TRACE_GROUP}/{self.profile.event_name} "
+                f"{ENGINE_PATH}:0x{self.profile.probe_offset:x} "
+                f"{self.profile.fetch}"
             )
             self._adb_root(
-                f"echo 1 '>' {self.instance_path}/events/{TRACE_GROUP}/detector_output/enable"
+                f"echo 1 '>' {self.instance_path}/events/{TRACE_GROUP}/{self.profile.event_name}/enable"
             )
             self._adb_root(f"echo 1 '>' {self.instance_path}/tracing_on")
             self._configured = True
-            remote_command = f"su -c 'cat {self.instance_path}/trace_pipe'"
-            self._process = subprocess.Popen(
-                [self.adb, "shell", remote_command],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                bufsize=1,
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-            )
+            self._process = self._open_trace_pipe()
             self._thread = threading.Thread(target=self._read, daemon=True)
             self._thread.start()
+            # Drop the extra interactive `su` while the preview runs. This
+            # Magisk build deadlocks USB within seconds if gaze keeps that
+            # shell plus trace_pipe plus the tongue live-adb-su relay, and
+            # VRChat is already on the same cable.
+            if self._root_shell is not None:
+                self._root_shell.close()
+                self._root_shell = None
         except Exception:
             try:
                 self._cleanup()
@@ -474,7 +628,11 @@ class RawTraceEyeReader:
 
     def _read(self) -> None:
         assert self._process is not None and self._process.stdout is not None
-        parser = DetectorOutputParser()
+        parser = (
+            StereoDetectorParser()
+            if self.profile is not None and self.profile.event_name == "detector_pair"
+            else DetectorOutputParser()
+        )
         try:
             for line in self._process.stdout:
                 if self._stopping:
@@ -508,24 +666,43 @@ class RawTraceEyeReader:
         if self._process is not None and self._process.poll() is None:
             self._process.terminate()
             try:
-                self._process.wait(timeout=1.0)
+                self._process.wait(timeout=1.5)
             except subprocess.TimeoutExpired:
                 self._process.kill()
+                try:
+                    self._process.wait(timeout=1.0)
+                except subprocess.TimeoutExpired:
+                    pass
         if self._thread is not None:
             self._thread.join(timeout=1.0)
-        if self._root_shell is not None:
+        try:
             self._cleanup()
-            self._root_shell.close()
-            self._root_shell = None
+        except Exception as error:
+            print(f"WARNING: eye-trace cleanup failed: {error}", flush=True)
+        finally:
+            if self._root_shell is not None:
+                self._root_shell.close()
+                self._root_shell = None
 
 
-def save_capture(path: Path, samples: list[RawEyeSample]) -> None:
+def save_capture(
+    path: Path,
+    samples: list[RawEyeSample],
+    profile: TrackingEngineProfile | None = None,
+) -> None:
+    active = profile or AUGUST_20260805_PROFILE
     payload = {
         "format": "qpro-visual-axis-detector-output-v1",
         "created_unix_ns": time.time_ns(),
-        "engine_size": EXPECTED_ENGINE_SIZE,
-        "probe_offset": DETECTOR_PROBE_OFFSET,
-        "eye_mapping": "EyeData tag byte 0=left, 1=right",
+        "firmware_profile": active.name,
+        "engine_size": active.size,
+        "engine_sha256": active.sha256,
+        "probe_offset": active.probe_offset,
+        "eye_mapping": (
+            "x20+0x30 left, x20+0xc0 right"
+            if active.event_name == "detector_pair"
+            else "EyeData tag byte 0=left, 1=right"
+        ),
         "samples": [asdict(sample) for sample in samples],
     }
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -591,6 +768,8 @@ def main() -> int:
             if not captured:
                 raise RuntimeError("The detector trace produced no paired eye samples")
             print(json.dumps({
+                "firmware_profile": reader.profile.name if reader.profile else "",
+                "probe_offset": reader.profile.probe_offset if reader.profile else None,
                 "samples": len(captured),
                 "rate_hz": len(captured) / arguments.headless_seconds,
                 "latest": asdict(captured[-1]),
@@ -644,9 +823,15 @@ def main() -> int:
             image = np.zeros((760, 1180, 3), dtype=np.uint8)
             put_text(image, arguments.title, (24, 40),
                      (245, 245, 245), 0.9, 2)
+            profile_text = "firmware profile pending"
+            if reader.profile is not None:
+                profile_text = (
+                    f"{reader.profile.name} | probe 0x{reader.profile.probe_offset:x} "
+                    f"| paired {sample_rate:.1f} Hz"
+                )
             put_text(
                 image,
-                f"computed before EyeData publication/fusion | paired {sample_rate:.1f} Hz",
+                profile_text,
                 (24, 72), (170, 170, 170), 0.5,
             )
             put_text(
@@ -735,7 +920,7 @@ def main() -> int:
             if character == "s":
                 stamp = time.strftime("%Y%m%d-%H%M%S")
                 path = Path("calibration") / f"detector-eye-probe-{stamp}.json"
-                save_capture(path, samples)
+                save_capture(path, samples, reader.profile)
                 saved_message = f"Saved {path.resolve()}"
     finally:
         if calibration is not None:

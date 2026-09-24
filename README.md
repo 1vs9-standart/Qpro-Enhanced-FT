@@ -1,10 +1,4 @@
-# Quest Pro Tongue + Eye Convergence Tracking
-
-## [Watch the demo!](https://youtu.be/BR_hIHFeo80)
-[![Watch the demo](https://github.com/user-attachments/assets/df6e8aab-7081-449b-bb0d-14f7e286a5b3)](https://youtu.be/BR_hIHFeo80)
-
-## ROOT IS REQUIRED FOR THIS TO FUNCITON. IF YOU ARE NOT ON v2.7 OR LOWER THIS WILL NOT WORK
-[Root details](https://github.com/Lumince/singularity)
+# QproFaceTracking
 
 ## Download
 
@@ -40,7 +34,6 @@ rooted Quest Pro and currently supports USB only.
   slower, especially for the full dataset.
 
 ## First run
-DISCLAIMER: Eye convergence may NOT work on modern firmwares, I have ONLY tested it on version `51483620027600340`
 
 1. Extract the entire release folder. Do not run the executable from inside the zip.
 2. Double-click `QproFaceTracking.exe`.
@@ -51,7 +44,14 @@ DISCLAIMER: Eye convergence may NOT work on modern firmwares, I have ONLY tested
    file associations, or PATH entries. PyTorch is a large download, but later
    release folders reuse the same runtime. Setup uses PyTorch's official CUDA 12.8
    wheel when an NVIDIA driver/GPU is detected and the official CPU wheel
-   otherwise.
+   otherwise. If you upgraded from v0.1.5 and training reports CPU fallback despite
+   having NVIDIA hardware, run this step again to repair the earlier CPU-only
+   runtime.
+
+The PC-runtime status becomes green only after OpenCV, NumPy, and PyTorch all pass
+their final import check. Merely finding a partially created `python.exe` is not
+considered complete. An interrupted or failed setup can be retried with the same
+button; it reuses the private Python installation and repairs the environment.
 4. Close VRCFaceTracking, then select **Install/update bridge**. Restart VRCFT.
 5. For independent gaze, connect the rooted headset and select **Prepare gaze from
    headset**. The tool reads the stock eye archive from *your headset*, creates the
@@ -60,6 +60,24 @@ DISCLAIMER: Eye convergence may NOT work on modern firmwares, I have ONLY tested
 7. Choose gaze and/or tongue tracking, select profiles and settings, then press
    **Apply and start selected**.
 8. Press **Stop and restore stock** before disconnecting USB or closing the app.
+
+Opening the hub does not modify tracking. The hub checks every prerequisite before
+Apply. If a tracking window is still closing, press `Q` in that window and wait for
+the activity panel to confirm restoration.
+
+The setup page marks completed steps in green and pulses the first unfinished
+action. Successful setup and model training show a confirmation and play a short
+sound; a warning sound accompanies an Apply attempt whose prerequisites are not
+ready. A setup progress strip appears only while a first-time action is active and
+animates during long operations such as the initial private-runtime installation.
+The setup and personalization pages scroll independently at high Windows
+DPI scaling, and the setup cards use DPI-aware sizing to keep their descriptions
+and buttons visible.
+
+Before gaze preparation starts, the hub checks the headset connection and root
+access separately. A missing, offline, or unauthorized ADB device produces direct
+USB/debugging guidance; a visible headset that rejects `su` produces separate
+root/Magisk guidance instead of a generic script error.
 
 Tongue training automatically selects CUDA when PyTorch can access it and falls
 back to CPU instead of failing on systems without NVIDIA graphics. The
@@ -127,7 +145,11 @@ The bundled developer v8 demo is protected from accidental deletion.
 - **Camera FPS cap:** 24 is the conservative default. Higher choices, up to 72,
   request a faster headset source cadence. On the tested Quest Pro, a 72 cap was
   stable but produced about 36 paired stereo samples per second; it does not imply
-  72 completed tongue inferences per second.
+  72 completed tongue inferences per second. Use a rear motherboard USB 3 SuperSpeed
+  port, not a case front-panel header or hub. If the live preview freezes after the
+  tongue model loads while VRChat is running, drop the cap to 12 rather than
+  raising it: the USB cable is already carrying ADB, Magisk `su`, and the camera
+  relay next to Virtual Desktop.
 
 ## Source and development
 
@@ -163,5 +185,18 @@ consent. A headset reboot removes injected native code. The launcher also uses a
 capture lease and attempts scoped cleanup on every normal exit.
 
 Firmware updates can change provider symbols, trace offsets, or model contracts.
-Treat every update as unsupported until revalidated. This project is unaffiliated
-with Meta, Virtual Desktop, VRCFaceTracking, VRChat, Project Babble, or EyeTrackVR.
+Treat every update as unsupported until revalidated. Independent gaze currently
+has two explicit engine profiles:
+
+- `seacliff-20260805` is the August 5 2026 engine, size 47,724,232, detector
+  probe `0xB63FE4`. Its offsets are unchanged.
+- `seacliff-51503870024400340` is Quest firmware 51503870024400340. It is
+  selected only when `libtrackingengines.so` is exactly 47,418,280 bytes and
+  SHA-256 `0fb6f54a3e190bec791d757ea18d32a8ecc1af4a861992d04b1703c93293cd03`.
+  That profile uses detector probe `0xB20F58`, which was verified on a live
+  headset at about 228 Hz with independent unit-length eye rays. The August
+  offsets are not used for this firmware.
+
+Any other engine size, or this size with a different hash, fails before a probe
+is installed. Startup prints the selected profile name, size, and probe offset.
+This project is unaffiliated with Meta, Virtual Desktop, VRCFaceTracking, VRChat, Project Babble, or EyeTrackVR.

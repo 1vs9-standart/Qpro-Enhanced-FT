@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import argparse
 import http.server
+import multiprocessing
+import queue
 import socket
 import struct
 import sys
@@ -43,6 +45,32 @@ CAMERA_NAMES = {
 }
 
 
+def connect_headset_stream(
+    host: str,
+    port: int,
+    stop_file: Path | None = None,
+    timeout_sec: float = 20.0,
+) -> socket.socket:
+    deadline = time.monotonic() + timeout_sec
+    while True:
+        if stop_file is not None and stop_file.exists():
+            raise SystemExit(0)
+        try:
+            connection = socket.create_connection((host, port), timeout=2)
+            # create_connection() leaves a 2s timeout. Keep the live stream
+            # blocking so a camera pause cannot abort the session.
+            connection.settimeout(None)
+            connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            return connection
+        except OSError:
+            if time.monotonic() >= deadline:
+                raise ConnectionError(
+                    "The injected streamer did not begin listening. "
+                    "Send the three logs."
+                )
+            time.sleep(0.25)
+
+
 def receive_exact(connection: socket.socket, size: int) -> bytes:
     output = bytearray(size)
     view = memoryview(output)
@@ -53,6 +81,81 @@ def receive_exact(connection: socket.socket, size: int) -> bytes:
             raise ConnectionError("The headset streamer disconnected")
         received += amount
     return bytes(output)
+
+
+def waiting_camera_image(message: str) -> np.ndarray:
+    image = np.zeros((400, 800, 3), dtype=np.uint8)
+    cv2.putText(
+        image, message, (40, 190),
+        cv2.FONT_HERSHEY_SIMPLEX, 0.72, (80, 190, 255), 2, cv2.LINE_AA,
+    )
+    cv2.putText(
+        image, "Q quits. The window stays alive while waiting for frames.",
+        (40, 240), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (170, 170, 170), 1, cv2.LINE_AA,
+    )
+    return image
+
+
+def loading_tongue_image() -> np.ndarray:
+    image = np.zeros((760, 1100, 3), dtype=np.uint8)
+    cv2.putText(
+        image, "Loading CUDA tongue model in a sidecar process...",
+        (40, 340), cv2.FONT_HERSHEY_SIMPLEX, 0.72, (80, 190, 255), 2, cv2.LINE_AA,
+    )
+    cv2.putText(
+        image, "Mouth cameras stay live while this loads.",
+        (40, 390), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (170, 170, 170), 1, cv2.LINE_AA,
+    )
+    return image
+
+
+class HeadsetStreamReader:
+    """Keep blocking headset reads off the OpenCV thread.
+
+    If the streamer stalls, the preview must still pump waitKey so Q and the
+    hub Stop file can exit. A full frame is never decoded on the UI thread.
+    """
+
+    def __init__(self, connection: socket.socket, shared: "SharedPreview") -> None:
+        self._connection = connection
+        self._shared = shared
+        self._queue: queue.Queue[object] = queue.Queue(maxsize=1)
+        self._thread = threading.Thread(
+            target=self._run, name="headset-stream", daemon=True
+        )
+        self._thread.start()
+
+    def _publish(self, item: object) -> None:
+        try:
+            self._queue.put_nowait(item)
+        except queue.Full:
+            try:
+                self._queue.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                self._queue.put_nowait(item)
+            except queue.Full:
+                pass
+
+    def _run(self) -> None:
+        try:
+            while self._shared.running:
+                raw_header = receive_exact(self._connection, HEADER.size)
+                fields = HEADER.unpack(raw_header)
+                payload = receive_exact(self._connection, int(fields[9]))
+                self._publish((raw_header, fields, payload, time.monotonic_ns()))
+        except Exception as error:
+            self._publish(error)
+
+    def poll(self, timeout: float = 0.05) -> tuple[object, ...] | None:
+        try:
+            item = self._queue.get(timeout=timeout)
+        except queue.Empty:
+            return None
+        if isinstance(item, Exception):
+            raise item
+        return item  # type: ignore[return-value]
 
 
 def camera_ids_from_mask(mask: int) -> list[int]:
@@ -405,6 +508,10 @@ def main() -> int:
     parser.add_argument("--gaze-calibration-seconds", type=int, default=60)
     parser.add_argument("--convergence-calibration-seconds", type=int, default=40)
     arguments = parser.parse_args()
+    # Preview shares the GPU with VRChat. OpenCL imshow/cvtColor stalls the UI
+    # on that path; CUDA tongue inference already runs in a sidecar process.
+    cv2.ocl.setUseOpenCL(False)
+    cv2.setNumThreads(1)
     stop_file = Path(arguments.stop_file).resolve() if arguments.stop_file else None
     if arguments.record_seconds < 0:
         parser.error("--record-seconds cannot be negative")
@@ -498,6 +605,7 @@ def main() -> int:
     connection: socket.socket | None = None
     print(f"Selected MJPEG: http://127.0.0.1:{arguments.mjpeg_port}/selected.mjpg")
     print("Per-camera MJPEG: /camera0.mjpg through /camera4.mjpg; /strip.mjpg")
+    stream_reader: HeadsetStreamReader | None = None
 
     frames = 0
     fps = 0.0
@@ -628,6 +736,15 @@ def main() -> int:
                 f"Listening for timestamped Virtual Desktop labels on "
                 f"127.0.0.1:{arguments.labels_port}"
             )
+        # Hold the headset client-lease before CUDA/model import. Loading the
+        # tongue weights can take over a minute; connecting afterwards only
+        # yields a leftover frame, then the cameras freeze.
+        print("Connecting to headset streamer (up to 20 seconds)...")
+        connection = connect_headset_stream(
+            arguments.host, arguments.port, stop_file=stop_file
+        )
+        stream_reader = HeadsetStreamReader(connection, shared)
+        print("Connected. Keys 0-4 select cameras; S selects strip; Q quits.")
         if arguments.model is not None:
             from model_preview import LiveModelPreview
 
@@ -639,13 +756,12 @@ def main() -> int:
                 f"{live_model.checkpoint_path}"
             )
         if arguments.tongue_model is not None:
-            from tongue_model_preview import (
-                LiveTongueModelPreview,
-                TongueBroadcaster,
-                TongueInferenceWorker,
-            )
+            from tongue_broadcast import TongueBroadcaster
+            from tongue_inference_process import TongueInferenceProcess
 
-            tongue_model_preview = LiveTongueModelPreview(
+            # Load CUDA in another process. torch.load in this process holds the
+            # GIL and the headset client-lease dies after the first frames.
+            tongue_inference_worker = TongueInferenceProcess(
                 arguments.tongue_model,
                 device_name=arguments.tongue_model_device,
                 direction_checkpoint_path=arguments.tongue_direction_model,
@@ -653,21 +769,16 @@ def main() -> int:
                 visibility_mode=arguments.tongue_visibility_mode,
             )
             tongue_broadcaster = TongueBroadcaster(enabled=arguments.tongue_output)
-            tongue_inference_worker = TongueInferenceWorker(
-                tongue_model_preview, tongue_broadcaster
-            )
+            tongue_model_preview = tongue_inference_worker
             print(
-                f"Loaded opt-in stereo tongue model on "
-                f"{tongue_model_preview.device}: {tongue_model_preview.checkpoint_path}"
+                "CUDA tongue model loads in a sidecar process so the camera "
+                "stream can stay live.",
+                flush=True,
             )
-            if tongue_model_preview.direction_checkpoint_path is not None:
-                print(
-                    "Direction ensemble model: "
-                    f"{tongue_model_preview.direction_checkpoint_path}"
-                )
             print(
                 "Experimental VRCFT tongue output starts "
-                + ("ON." if arguments.tongue_output else "OFF. Press T to toggle it.")
+                + ("ON." if arguments.tongue_output else "OFF. Press T to toggle it."),
+                flush=True,
             )
         if (arguments.open_source_preview or arguments.hybrid_preview
                 or arguments.eye_calibration):
@@ -726,33 +837,66 @@ def main() -> int:
             if open_source_preview is not None:
                 cv2.namedWindow(open_source_window_name, cv2.WINDOW_NORMAL)
                 cv2.resizeWindow(open_source_window_name, 1240, 880)
-        print("Connecting to headset streamer (up to 20 seconds)...")
-        deadline = time.monotonic() + 20.0
-        while connection is None:
-            if stop_file is not None and stop_file.exists():
-                return 0
-            try:
-                connection = socket.create_connection(
-                    (arguments.host, arguments.port), timeout=2
-                )
-            except OSError:
-                if time.monotonic() >= deadline:
-                    raise ConnectionError(
-                        "The injected streamer did not begin listening. "
-                        "Send the three logs."
-                    )
-                time.sleep(0.25)
-        connection.settimeout(None)
-        connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        print("Connected. Keys 0-4 select cameras; S selects strip; Q quits.")
+        last_camera_display = waiting_camera_image("Waiting for mouth cameras...")
+        last_tongue_model_image = (
+            loading_tongue_image() if tongue_model_preview is not None else None
+        )
+        last_ui = 0.0
+        ui_interval = 1.0 / 10.0
+        if not arguments.no_window:
+            cv2.imshow(window_name, last_camera_display)
+            if last_tongue_model_image is not None:
+                cv2.imshow(tongue_model_window_name, last_tongue_model_image)
+            cv2.waitKeyEx(1)
         while shared.running:
             if stop_file is not None and stop_file.exists():
                 shared.running = False
+                try:
+                    connection.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
                 break
-            raw_header = receive_exact(connection, HEADER.size)
+            if tongue_inference_worker is not None:
+                loaded = tongue_inference_worker.pump()
+                if loaded:
+                    print(loaded, flush=True)
+                    if tongue_inference_worker.direction_checkpoint_path is not None:
+                        print(
+                            "Direction ensemble model: "
+                            f"{tongue_inference_worker.direction_checkpoint_path}",
+                            flush=True,
+                        )
+            try:
+                polled = stream_reader.poll(0.05)
+            except (ConnectionError, TimeoutError) as error:
+                if not arguments.no_window:
+                    last_camera_display = waiting_camera_image(
+                        "Camera stream disconnected. Press Q."
+                    )
+                    cv2.imshow(window_name, last_camera_display)
+                    if last_tongue_model_image is not None:
+                        cv2.imshow(tongue_model_window_name, last_tongue_model_image)
+                    key = cv2.waitKeyEx(1)
+                    if key >= 0:
+                        handle_key(shared, chr(key & 0xFF))
+                    if shared.running:
+                        print(str(error), flush=True)
+                        continue
+                    break
+                raise
+            if polled is None:
+                if not arguments.no_window:
+                    now_ui = time.monotonic()
+                    if now_ui - last_ui >= ui_interval:
+                        last_ui = now_ui
+                        key = cv2.waitKeyEx(1)
+                        if key >= 0:
+                            handle_key(shared, chr(key & 0xFF))
+                continue
+            raw_header, fields, payload, pc_monotonic_ns = polled
             (magic, version, header_size, sequence, timestamp_ns, width, height,
              stride, pixel_format, payload_size, camera_mask,
-             rejected_torn) = HEADER.unpack(raw_header)
+             rejected_torn) = fields
             if magic != MAGIC or version != 3 or header_size != HEADER.size:
                 raise ValueError("Unexpected live-stream header")
             camera_ids = camera_ids_from_mask(camera_mask)
@@ -764,8 +908,6 @@ def main() -> int:
                 )
             if payload_size != width * height:
                 raise ValueError("Invalid payload size")
-            payload = receive_exact(connection, payload_size)
-            pc_monotonic_ns = time.monotonic_ns()
             stream_gap_stats.add(timestamp_ns, pc_monotonic_ns)
             frame_replay_stats.add(payload)
             record_this_frame = bool(
@@ -838,8 +980,19 @@ def main() -> int:
                     strip,
                     factory_sample,
                     label_recorder.schema_names if label_recorder else [],
+                    output_enabled=bool(
+                        tongue_broadcaster is not None and tongue_broadcaster.enabled
+                    ),
                 )
                 tongue_prediction, tongue_model_image = tongue_inference_worker.latest()
+                if (
+                    tongue_prediction is not None
+                    and tongue_broadcaster is not None
+                    and tongue_inference_worker.target_names
+                ):
+                    tongue_broadcaster.send_prediction(
+                        tongue_prediction, tongue_inference_worker.target_names
+                    )
             if open_source_preview is not None:
                 open_source_prediction = open_source_preview.predict(strip)
                 factory_sample = (
@@ -870,26 +1023,28 @@ def main() -> int:
             if not arguments.no_window:
                 with shared.lock:
                     selected = shared.selected
-                cv2.imshow(
-                    window_name,
-                    label_strip(
-                        strip, camera_ids, fps, selected, sequence_gap,
-                        rejected_torn, throughput_mbps,
-                        capture_writer.frame_count if capture_writer else 0,
-                        label_recorder.sample_count if label_recorder else 0,
-                        frame_replay_stats.suspected_replays,
-                        *stream_gap_stats.summaries(),
-                    ),
+                last_camera_display = label_strip(
+                    strip, camera_ids, fps, selected, sequence_gap,
+                    rejected_torn, throughput_mbps,
+                    capture_writer.frame_count if capture_writer else 0,
+                    label_recorder.sample_count if label_recorder else 0,
+                    frame_replay_stats.suspected_replays,
+                    *stream_gap_stats.summaries(),
                 )
-                if model_image is not None:
-                    cv2.imshow(model_window_name, model_image)
-                if tongue_model_image is not None:
-                    cv2.imshow(tongue_model_window_name, tongue_model_image)
-                if open_source_image is not None:
-                    cv2.imshow(open_source_window_name, open_source_image)
-                key = cv2.waitKeyEx(1)
-                if key >= 0:
-                    handle_key(shared, chr(key & 0xFF))
+                now_ui = time.monotonic()
+                if now_ui - last_ui >= ui_interval:
+                    last_ui = now_ui
+                    cv2.imshow(window_name, last_camera_display)
+                    if model_image is not None:
+                        cv2.imshow(model_window_name, model_image)
+                    if tongue_model_image is not None:
+                        last_tongue_model_image = tongue_model_image
+                        cv2.imshow(tongue_model_window_name, last_tongue_model_image)
+                    if open_source_image is not None:
+                        cv2.imshow(open_source_window_name, open_source_image)
+                    key = cv2.waitKeyEx(1)
+                    if key >= 0:
+                        handle_key(shared, chr(key & 0xFF))
             if tongue_broadcaster is not None:
                 for runtime_key in shared.take_runtime_keys():
                     if runtime_key == "t":
@@ -1048,4 +1203,5 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    multiprocessing.freeze_support()
     raise SystemExit(main())

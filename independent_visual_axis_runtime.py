@@ -156,7 +156,10 @@ def main() -> int:
         else None
     )
     window = "Quest Pro calibrated independent gaze"
+    last_ui = 0.0
     if deadline is None:
+        # Same VRChat GPU contention as receiver.py; gaze drawing does not need OpenCL.
+        cv2.ocl.setUseOpenCL(False)
         cv2.namedWindow(window, cv2.WINDOW_NORMAL)
         cv2.resizeWindow(window, 1180, 760)
 
@@ -165,6 +168,8 @@ def main() -> int:
         # halfway through, close() must still remove the headset reader and
         # trace instance instead of poisoning the next GUI launch.
         reader.start()
+        if reader.profile is None:
+            raise RuntimeError("No tracking-engine profile was selected")
         while deadline is None or time.monotonic() < deadline:
             if stop_file is not None and stop_file.exists():
                 break
@@ -197,6 +202,17 @@ def main() -> int:
                     time.sleep(0.005)
                 continue
 
+            # A full 1180x760 redraw every 2 ms fights VRChat for the GPU and
+            # freezes both previews. Cap the window at 15 Hz; keep draining
+            # detector samples above. Always pump waitKey so Stop/Q work.
+            now_ui = time.monotonic()
+            if now_ui - last_ui < (1.0 / 15.0):
+                key = cv2.waitKey(10) & 0xFF
+                if key in (ord("q"), 27):
+                    break
+                continue
+            last_ui = now_ui
+
             image = np.zeros((760, 1180, 3), dtype=np.uint8)
             put_text(image, "Quest Pro calibrated independent gaze", (24, 40),
                      (245, 245, 245), 0.9, 2)
@@ -205,7 +221,11 @@ def main() -> int:
             put_text(image, mode, (24, 74), mode_color, 0.58, 1)
             put_text(
                 image,
-                "Meta node-18 local branch + per-eye fit + independent mild smoothing",
+                (
+                    f"{reader.profile.name} | probe 0x{reader.profile.probe_offset:x}"
+                    if reader.profile is not None
+                    else "firmware profile pending"
+                ),
                 (24, 102), (175, 175, 175), 0.5,
             )
             if latest is None or filtered_left is None or filtered_right is None:
@@ -257,13 +277,15 @@ def main() -> int:
             key = cv2.waitKey(1) & 0xFF
             if key in (ord("q"), 27):
                 break
-            if not received:
-                time.sleep(0.002)
 
         if latest is None or filtered_left is None or filtered_right is None:
             raise RuntimeError("The detector trace produced no paired eye samples")
         if deadline is not None:
             print(json.dumps({
+                "firmware_profile": reader.profile.name if reader.profile else "",
+                "probe_offset": (
+                    reader.profile.probe_offset if reader.profile else None
+                ),
                 "rate_hz": rate_hz,
                 "trace_tag_0_raw_deg": latest.left_angles,
                 "trace_tag_1_raw_deg": latest.right_angles,

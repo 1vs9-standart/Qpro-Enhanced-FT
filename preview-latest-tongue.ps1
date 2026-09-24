@@ -1,6 +1,6 @@
 param(
     [ValidateRange(1, 120)]
-    [int]$MaxFps = 30,
+    [int]$MaxFps = 24,
     [ValidateSet("auto", "cpu", "cuda", "cuda:0")]
     [string]$Device = "auto",
     [string]$AdbTarget = "",

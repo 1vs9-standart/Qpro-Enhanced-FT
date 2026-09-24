@@ -6,7 +6,7 @@ param(
     [ValidateSet("all", "face", "eyes", "mouth")]
     [string]$CameraMode = "all",
     [ValidateRange(0, 120)]
-    [int]$MaxFps = 30,
+    [int]$MaxFps = 24,
     [ValidateRange(1024, 65535)]
     [int]$StreamPort = 27273,
     [string]$AdbTarget = "",
@@ -93,6 +93,76 @@ if (Get-Variable PSNativeCommandUseErrorActionPreference -ErrorAction SilentlyCo
 }
 $adbExecutable = Find-AdbExecutable
 
+function Invoke-AdbSuTimed([string]$Command, [int]$TimeoutMs = 4000) {
+    $stamp = [guid]::NewGuid().ToString("N")
+    $outPath = Join-Path $env:TEMP "qpro-su-out-$stamp.txt"
+    $errPath = Join-Path $env:TEMP "qpro-su-err-$stamp.txt"
+    try {
+        $proc = Start-Process -FilePath $adbExecutable `
+            -ArgumentList @("shell", "su", "-c", $Command) `
+            -PassThru -WindowStyle Hidden `
+            -RedirectStandardOutput $outPath `
+            -RedirectStandardError $errPath
+        if ($null -eq $proc) { return "" }
+        if (-not $proc.WaitForExit($TimeoutMs)) {
+            Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+            return ""
+        }
+        $text = ""
+        if (Test-Path -LiteralPath $outPath) {
+            $text = Get-Content -LiteralPath $outPath -Raw -ErrorAction SilentlyContinue
+        }
+        return (($text -replace "`r", "").Trim())
+    } finally {
+        Remove-Item -LiteralPath $outPath, $errPath -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Dismount-HeadsetStreamer {
+    # Relay --stop unlinks the shm file but leaves the .so mapped in sensors.
+    # One su command at a time: a piped script here is parsed by Windows, not Magisk.
+    # Restart sensors only. Never stop trackingservice.
+    $sensorsName = "vendor.oculus.hardware.sensors@1.0-service"
+    $oldPid = ((Invoke-AdbSuTimed "pidof $sensorsName" 4000) -split "\s+")[0]
+    if ([string]::IsNullOrWhiteSpace($oldPid)) {
+        Write-Host "STREAMER_UNLOAD skipped: sensors pid missing"
+        Invoke-AdbSuTimed "rm -f /data/local/tmp/questpro-live-v8-shared.bin /data/local/tmp/questpro-relay-v8.pid" 4000 | Out-Null
+        return
+    }
+    $maps = Invoke-AdbSuTimed "grep questpro /proc/$oldPid/maps" 4000
+    if ([string]::IsNullOrWhiteSpace($maps)) {
+        Write-Host "STREAMER_UNLOAD already_unmapped sensors=$oldPid"
+    } else {
+        Write-Host "STREAMER_UNLOAD mapped sensors=$oldPid"
+        Invoke-AdbSuTimed "kill $oldPid" 4000 | Out-Null
+        $newPid = ""
+        for ($n = 0; $n -lt 24; $n++) {
+            Start-Sleep -Milliseconds 250
+            $candidate = ((Invoke-AdbSuTimed "pidof $sensorsName" 4000) -split "\s+")[0]
+            if (-not [string]::IsNullOrWhiteSpace($candidate) -and $candidate -ne $oldPid) {
+                $newPid = $candidate
+                break
+            }
+        }
+        if ([string]::IsNullOrWhiteSpace($newPid)) {
+            Write-Host "STREAMER_UNLOAD WARNING: sensors did not restart"
+        } else {
+            $still = Invoke-AdbSuTimed "grep questpro /proc/$newPid/maps" 4000
+            if ([string]::IsNullOrWhiteSpace($still)) {
+                Write-Host "STREAMER_UNLOAD sensors=$newPid streamer_unmapped"
+            } else {
+                Write-Host "STREAMER_UNLOAD still_mapped sensors=$newPid"
+            }
+        }
+    }
+    Invoke-AdbSuTimed "rm -f /data/local/tmp/questpro-live-v8-shared.bin /data/local/tmp/questpro-relay-v8.pid" 4000 | Out-Null
+    $svc = Invoke-AdbSuTimed "getprop init.svc.trackingservice" 4000
+    if ($svc -ne "running") {
+        Write-Host "STREAMER_UNLOAD trackingservice=$svc; starting"
+        Invoke-AdbSuTimed "start trackingservice" 4000 | Out-Null
+    }
+}
+
 $nativeArtifacts = @(
     (Join-Path $PSScriptRoot "libquestpro-camera-streamer-v8.so"),
     (Join-Path $PSScriptRoot "questpro-camera-relay-v8"),
@@ -115,7 +185,7 @@ if ($needsNativeBuild) {
 
 Push-Location $PSScriptRoot
 try {
-    Write-Host "QproFaceTracking launcher v2.35 (stream port $StreamPort)"
+    Write-Host "QproFaceTracking launcher v2.36 (stream port $StreamPort)"
     if (-not [string]::IsNullOrWhiteSpace($AdbTarget)) {
         $adbState = & $adbExecutable get-state 2>&1
         if ($LASTEXITCODE -ne 0 -or ($adbState -join "`n").Trim() -ne "device") {
@@ -140,7 +210,6 @@ try {
     if ($TongueCalibration -or $TongueStillCalibration -or $TongueCorrectionCalibration -or $TongueRefinementCalibration -or $TongueArcCalibration) { $CameraMode = "face" }
     if ($TonguePreview) {
         $CameraMode = "mouth"
-        if (-not $PSBoundParameters.ContainsKey("MaxFps")) { $MaxFps = 20 }
     }
 
     $recordEnabled = $Record -or $Calibration -or $TongueCalibration -or $TongueStillCalibration -or $TongueCorrectionCalibration -or $TongueRefinementCalibration -or $TongueArcCalibration -or -not [string]::IsNullOrWhiteSpace($RecordPath)
@@ -308,42 +377,49 @@ try {
         @($injectOutput | ForEach-Object { $_.ToString() }) | Tee-Object -FilePath .\questpro-live-inject.txt
         if ($injectExit -ne 0) { throw "Injection failed with exit code $injectExit. Send questpro-live-inject.txt." }
     }
-    if (-not [string]::IsNullOrWhiteSpace($AdbTarget)) {
-        # A relay orphaned by `nohup ... &` loses the live Magisk su execution
-        # context on this headset and then cannot fchmod/mmap the shared file.
-        # Keep the adb/su session alive for the relay's lifetime over Wi-Fi.
-        $relayExec = "/data/local/tmp/questpro-camera-relay-v8 --mode $CameraMode --max-fps $MaxFps"
-        Remove-Item -LiteralPath $relayClientOutputPath, $relayClientErrorPath -Force -ErrorAction SilentlyContinue
-        $relayArguments = "shell su -c `"$relayExec`""
-        $relayProcess = Start-Process -FilePath $adbExecutable `
-            -ArgumentList $relayArguments `
-            -PassThru -WindowStyle Hidden `
-            -RedirectStandardOutput $relayClientOutputPath `
-            -RedirectStandardError $relayClientErrorPath
-        Start-Sleep -Milliseconds 800
-        if ($relayProcess.HasExited) {
-            $relayOutput = if (Test-Path -LiteralPath $relayClientOutputPath) { Get-Content -LiteralPath $relayClientOutputPath -Raw } else { "" }
-            $relayError = if (Test-Path -LiteralPath $relayClientErrorPath) { Get-Content -LiteralPath $relayClientErrorPath -Raw } else { "" }
-            $relayLogText = (($relayOutput, $relayError) -join "`n").Trim()
-            Set-Content -LiteralPath .\questpro-live-relay.txt -Value $relayLogText
-            if (-not [string]::IsNullOrWhiteSpace($relayLogText)) { Write-Host $relayLogText }
-            $relayProcess.Dispose()
-            $relayProcess = $null
-            throw "The wireless root relay exited during startup. Send questpro-live-relay.txt."
+    # A relay orphaned by `nohup ... &` loses the live Magisk su execution
+    # context on this Singularity/Magisk build and then cannot fchmod/mmap the
+    # shared file (SHARED_MEMORY_FAILED / Operation not permitted). Keep the
+    # adb/su session alive for the relay's lifetime on USB and Wi-Fi.
+    $relayExec = "/data/local/tmp/questpro-camera-relay-v8 --mode $CameraMode --max-fps $MaxFps"
+    Remove-Item -LiteralPath $relayClientOutputPath, $relayClientErrorPath -Force -ErrorAction SilentlyContinue
+    $relayArguments = "shell su -c `"$relayExec`""
+    $relayProcess = Start-Process -FilePath $adbExecutable `
+        -ArgumentList $relayArguments `
+        -PassThru -WindowStyle Hidden `
+        -RedirectStandardOutput $relayClientOutputPath `
+        -RedirectStandardError $relayClientErrorPath
+    $relayStarted = $true
+    $relayReady = $false
+    for ($i = 0; $i -lt 25; $i++) {
+        Start-Sleep -Milliseconds 200
+        if ($relayProcess.HasExited) { break }
+        $relayOutput = if (Test-Path -LiteralPath $relayClientOutputPath) {
+            Get-Content -LiteralPath $relayClientOutputPath -Raw -ErrorAction SilentlyContinue
+        } else { "" }
+        if ($relayOutput -match "RELAY_LISTENING") {
+            $relayReady = $true
+            break
         }
-        $relayStarted = $true
-        Write-Host "RELAY_LISTENING address=127.0.0.1 port=$StreamPort mode=$CameraMode max_fps=$MaxFps transport=live-adb-su"
     }
-    else {
-        $relayCommand = 'chmod 755 /data/local/tmp/questpro-camera-relay-v8; : > /data/local/tmp/questpro-relay-v8.log; nohup /data/local/tmp/questpro-camera-relay-v8 --mode {0} --max-fps {1} > /data/local/tmp/questpro-relay-v8.log 2>&1 < /dev/null &' -f $CameraMode, $MaxFps
-        & $adbExecutable shell su -c $relayCommand
-        if ($LASTEXITCODE -ne 0) { throw "Starting the root relay failed with exit code $LASTEXITCODE" }
-        $relayStarted = $true
-        Start-Sleep -Milliseconds 800
-        $relayLog = & $adbExecutable shell su -c "cat /data/local/tmp/questpro-relay-v8.log" 2>&1
-        @($relayLog | ForEach-Object { $_.ToString() }) | Tee-Object -FilePath .\questpro-live-relay.txt
-        if (-not (($relayLog -join "`n") -match "RELAY_LISTENING")) { throw "The root relay did not begin listening. Send questpro-live-relay.txt." }
+    if (-not $relayReady) {
+        $relayOutput = if (Test-Path -LiteralPath $relayClientOutputPath) {
+            Get-Content -LiteralPath $relayClientOutputPath -Raw -ErrorAction SilentlyContinue
+        } else { "" }
+        $relayError = if (Test-Path -LiteralPath $relayClientErrorPath) {
+            Get-Content -LiteralPath $relayClientErrorPath -Raw -ErrorAction SilentlyContinue
+        } else { "" }
+        $relayLogText = (($relayOutput, $relayError) -join "`n").Trim()
+        Set-Content -LiteralPath .\questpro-live-relay.txt -Value $relayLogText
+        if (-not [string]::IsNullOrWhiteSpace($relayLogText)) { Write-Host $relayLogText }
+        if (-not $relayProcess.HasExited) {
+            Stop-Process -Id $relayProcess.Id -Force -ErrorAction SilentlyContinue
+        }
+        $relayProcess.Dispose()
+        $relayProcess = $null
+        throw "The root relay did not begin listening. Send questpro-live-relay.txt."
     }
+    Write-Host "RELAY_LISTENING address=127.0.0.1 port=$StreamPort mode=$CameraMode max_fps=$MaxFps transport=live-adb-su"
 
     if ([string]::IsNullOrWhiteSpace($AdbTarget)) {
         $injectOutput = & $adbExecutable shell su -c $injectCommand 2>&1
@@ -443,22 +519,28 @@ try {
         Wait-Process -Id $labelBridgeProcess.Id -Timeout 2 -ErrorAction SilentlyContinue
     }
     if ($relayStarted) {
-        $stopOutput = & $adbExecutable shell su -c "/data/local/tmp/questpro-camera-relay-v8 --stop" 2>&1
-        if ($LASTEXITCODE -eq 0) { $stopOutput | ForEach-Object { Write-Host $_ } }
+        # Kill the live adb/su relay first. A second su --stop while that
+        # session is still open hangs Magisk on this headset, so the hub sits
+        # on "A window is still closing" forever.
         if ($null -ne $relayProcess) {
-            if (-not $relayProcess.WaitForExit(2000)) {
-                $relayProcess.Kill()
-                $relayProcess.WaitForExit(2000) | Out-Null
+            if (-not $relayProcess.HasExited) {
+                Stop-Process -Id $relayProcess.Id -Force -ErrorAction SilentlyContinue
+                $relayProcess.WaitForExit(3000) | Out-Null
             }
             $relayOutput = if (Test-Path -LiteralPath $relayClientOutputPath) { Get-Content -LiteralPath $relayClientOutputPath -Raw } else { "" }
             $relayError = if (Test-Path -LiteralPath $relayClientErrorPath) { Get-Content -LiteralPath $relayClientErrorPath -Raw } else { "" }
             (($relayOutput, $relayError) -join "`n").Trim() | Set-Content -LiteralPath .\questpro-live-relay.txt
             $relayProcess.Dispose()
+            $relayProcess = $null
         }
-        else {
-            $finalRelayLog = & $adbExecutable shell su -c "cat /data/local/tmp/questpro-relay-v8.log" 2>&1
-            @($finalRelayLog | ForEach-Object { $_.ToString() }) | Set-Content -LiteralPath .\questpro-live-relay.txt
+        $stopProc = Start-Process -FilePath $adbExecutable `
+            -ArgumentList @("shell", "su", "-c", "/data/local/tmp/questpro-camera-relay-v8 --stop") `
+            -PassThru -WindowStyle Hidden `
+            -Wait:$false
+        if ($null -ne $stopProc -and -not $stopProc.WaitForExit(2500)) {
+            Stop-Process -Id $stopProc.Id -Force -ErrorAction SilentlyContinue
         }
+        Dismount-HeadsetStreamer
     }
     $null = & $adbExecutable forward --remove "tcp:$StreamPort" 2>&1
     Pop-Location

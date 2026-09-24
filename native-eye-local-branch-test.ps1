@@ -105,8 +105,20 @@ function Wait-TrackingService {
     throw "The headset tracking service did not return to running state."
 }
 
+function Invoke-RootTimed([string]$Command, [int]$TimeoutMs = 4000) {
+    # A wedged Magisk `su` on `stop trackingservice` used to hang the hub
+    # forever and leave the Quest on the tracking-search screen.
+    $proc = Start-Process -FilePath $adb `
+        -ArgumentList @("shell", "su", "-c", $Command) `
+        -PassThru -WindowStyle Hidden
+    if ($null -eq $proc) { return }
+    if (-not $proc.WaitForExit($TimeoutMs)) {
+        Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+    }
+}
+
 function Restore-StockModel([string]$PropertyValue = "false") {
-    Invoke-Root "stop trackingservice" -AllowFailure | Out-Null
+    Invoke-RootTimed "stop trackingservice" 4000
     Invoke-Root "setprop $modelProperty $PropertyValue" -AllowFailure | Out-Null
     Invoke-Root "umount '$targetModel'" -AllowFailure | Out-Null
     Invoke-Root "start trackingservice" -AllowFailure | Out-Null
